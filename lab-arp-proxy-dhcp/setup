@@ -1,0 +1,186 @@
+#!/bin/sh
+
+LABNAME="lab-arp-proxy-dhcp"
+DEPS="screen ip vde_switch linux start-stop-daemon zsh dhcpd dhcrelay"
+PROGNAME=$(readlink -f $0)
+PROGARGS="$@"
+
+# Check for dependencies needed by this tool
+check_dependencies() {
+	for dep in $DEPS; do
+		which $dep 2> /dev/null > /dev/null || {
+		echo "[!] Missing dependency: $dep"
+		exit 1
+	}
+	done
+}
+
+# Run our lab in screen
+setup_screen() {
+	[ x"$TERM" = x"screen" ] || \
+
+	exec screen -ln -S $LABNAME -c /dev/null -t main "$PROGNAME" "$PROGARGS"
+	sleep 1
+	screen -X caption always "%{= wk}%-w%{= BW}%n %t%{-}%+w %-="
+	screen -X zombie cr
+}
+
+# Setup a VDE switch
+setup_switch() {
+	echo "[+] Setup switch $1"
+	screen -t "switch-$1" \
+		start-stop-daemon --make-pidfile --pidfile "$TMP/switch-$1.pid" \
+		--start --startas $(which vde_switch) -- \
+		--sock "$TMP/switch-$1.sock"
+	screen -X select 0
+}
+
+# Start a VM
+start_vm() {
+	echo "[+] Start VM $1"
+	name="$1"
+	shift
+	screen -t $name \
+		start-stop-daemon --make-pidfile --pidfile "$TMP/vm-$name.pid" \
+		--start --startas $(which linux) -- \
+		uts=$name mem=64M \
+		root=/dev/root rootfstype=hostfs init="$PROGNAME" \
+		"$@"
+	screen -X select 0
+}
+
+display_help() {
+    cat <<EOF
+
+Some screen commands :
+ C-a d     - Detach the screen (resume with screen -r $LABNAME)
+ C-a "     - Select a window
+ C-a space - Next window
+ C-a C-a   - Previous window
+EOF
+    echo "Press enter to exit the lab"
+    read a
+}
+
+cleanup() {
+    for pid in $TMP/*.pid; do
+        kill $(cat $pid)
+    done
+    screen -X quit
+}
+
+case $$ in
+    1)
+	# Inside UML. Three states:
+	#   1. Setup the getty
+	#   2. Setup AUFS
+	#   3. Remaining setup
+	STATE=${STATE:-1}
+
+	case $STATE in
+	    1)
+		echo "[+] Set hostname"
+		hostname -b ${uts}
+		echo "[+] Set path"
+		export TERM=xterm
+		export PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/local/sbin:/usr/sbin
+		
+		# Setup getty
+		export STATE=2
+		exec getty -n -l "$PROGNAME" 38400 /dev/tty0
+		;;
+	    2)
+		echo "[+] Setup AUFS"
+		mount -n -t proc proc /proc
+		mount -n -t sysfs sysfs /sys
+		mount -o bind /usr/lib/uml/modules /lib/modules
+		mount -n -t tmpfs tmpfs /tmp -o rw,nosuid,nodev
+		mkdir /tmp/ro
+		mkdir /tmp/rw
+		mkdir /tmp/aufs
+		mount -n -t hostfs hostfs /tmp/ro -o /,ro
+		mount -n -t aufs aufs /tmp/aufs -o noatime,dirs=/tmp/rw:/tmp/ro=ro
+
+		# Chroot inside our new root
+		export STATE=3
+		exec chroot /tmp/aufs "$PROGNAME"
+		;;
+	esac
+
+	echo "[+] Set filesystems"
+	rm /etc/mtab
+	mount -t proc proc /proc
+	mount -t sysfs sysfs /sys
+	mount -t tmpfs tmpfs /dev -o rw && {
+	cd /dev
+	if [ -f $(dirname "$PROGNAME")/dev.tar ]; then
+		tar xf $(dirname "$PROGNAME")/dev.tar
+	else
+		MAKEDEV null
+	fi
+	}
+	mount -o bind /usr/lib/uml/modules /lib/modules
+	for fs in /var/run /var/tmp /var/log /tmp; do
+		mount -t tmpfs tmpfs $fs -o rw,nosuid,nodev
+	done
+	mount -t hostfs hostfs $(dirname "$PROGNAME") -o $(dirname "$PROGNAME")
+
+	# Interfaces
+	echo "[+] Set interfaces"
+	for intf in /sys/class/net/*; do
+		intf=$(basename $intf)
+		ip a l dev $intf 2> /dev/null >/dev/null && ip link set up dev $intf
+	done
+
+	echo "[+] Start syslog"
+	rsyslogd
+
+	cd $(dirname "$PROGNAME")
+	[ -f dev.tar ] || {
+		tar -C /dev -cf dev.tar.$uts . && mv dev.tar.$uts dev.tar
+	}
+
+	# Configure each UML
+	echo "[+] Setup UML"
+	sysctl -w net.ipv4.ip_forward=1
+	case ${uts} in
+		R0)
+			ip addr add 192.168.1.254/24 dev eth0
+			dhcpd -d -cf R0/dhcpd.conf
+		;;
+		R1)
+			echo 1 > /proc/sys/net/ipv4/conf/all/proxy_arp
+			ip addr add 192.168.1.253/24 dev eth0
+			ip addr add 192.168.1.253/24 dev eth1
+			ip route del 192.168.1.0/24 dev eth1
+			ip route add 192.168.1.0/25 dev eth1
+			dhcrelay -d -a 192.168.1.254
+		;;
+		C*)
+			dhclient eth0
+			ip addr show eth0
+			ping 192.168.1.254
+		;;
+	esac
+
+	echo "[+] Drop to a shell"
+	exec /bin/zsh
+
+	;;
+	*)
+	TMP=$(mktemp -d)
+	trap "rm -rf $TMP" EXIT
+	check_dependencies
+	setup_screen
+	# Setup switches
+	setup_switch S0
+	setup_switch S1
+	# Start VM
+	start_vm R0 eth0=vde,$TMP/switch-S0.sock
+	start_vm R1 eth0=vde,$TMP/switch-S0.sock eth1=vde,$TMP/switch-S1.sock
+	start_vm C0 eth0=vde,$TMP/switch-S0.sock
+	start_vm C1 eth0=vde,$TMP/switch-S1.sock
+	display_help
+	cleanup
+	;;
+esac
